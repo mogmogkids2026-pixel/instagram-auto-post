@@ -269,6 +269,8 @@ def post_to_instagram(config: dict, content: dict, image_url: str = None):
         "access_token": access_token,
     }
     res = requests.post(create_url, data=create_params)
+    if not res.ok:
+        log(f"❌ メディア作成エラー: {res.status_code} {res.text}")
     res.raise_for_status()
     creation_id = res.json()["id"]
 
