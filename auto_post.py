@@ -2,13 +2,13 @@
 """
 もぐもぐキッズプロジェクト 自動投稿システム
 - Claude APIでキャプション・ハッシュタグを自動生成
+- テーマに合ったフォルダから未使用写真を選択（重複なし）
 - ドラフトをJSONで保存
-- Meta Graph APIが設定されていれば自動投稿（config.jsonにトークンを設定後に有効化）
+- Meta Graph APIで自動投稿
 """
 
 import json
 import os
-import sys
 import random
 import requests
 import anthropic
@@ -21,15 +21,30 @@ CONFIG_PATH = BASE_DIR / "config.json"
 DRAFTS_DIR = BASE_DIR / "drafts"
 LOGS_DIR = BASE_DIR / "logs"
 IMAGES_DIR = BASE_DIR / "images"
+POSTED_PHOTOS_PATH = BASE_DIR / "posted_photos.json"
+
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/mogmogkids2026-pixel/instagram-auto-post/main/images"
 
 # ディレクトリが存在しない場合は作成
 DRAFTS_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 IMAGES_DIR.mkdir(exist_ok=True)
+for folder in ["dental", "food", "product", "farm", "kids"]:
+    (IMAGES_DIR / folder).mkdir(exist_ok=True)
+
+# ===== テーマ → フォルダ マッピング =====
+THEME_TO_FOLDER = {
+    "食育Tips":      "food",
+    "噛む力・口腔発達": "dental",
+    "野菜嫌い克服":   "farm",
+    "米粉クッキー紹介": "product",
+    "育児応援メッセージ": "kids",
+    "言語発達と食事":  "dental",
+    "季節の食育":    "farm",
+}
 
 
 def load_config():
-    # GitHub Actions の場合は環境変数から読み込む
     if os.environ.get("ANTHROPIC_API_KEY"):
         return {
             "claude": {
@@ -40,9 +55,7 @@ def load_config():
                 "access_token": os.environ.get("INSTAGRAM_ACCESS_TOKEN", ""),
                 "ig_user_id": os.environ.get("INSTAGRAM_USER_ID", ""),
             },
-            "posting": {"schedule_hour": 9, "schedule_minute": 0},
         }
-    # ローカル実行の場合は config.json から読み込む
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -99,6 +112,68 @@ HASHTAGS_POOL = [
 ]
 
 
+# ===== 写真管理（重複なし選択） =====
+
+def load_posted_photos() -> dict:
+    """投稿済み写真の記録を読み込む"""
+    if POSTED_PHOTOS_PATH.exists():
+        with open(POSTED_PHOTOS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_posted_photos(data: dict):
+    """投稿済み写真の記録を保存する"""
+    with open(POSTED_PHOTOS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def get_next_image(theme_type: str) -> str | None:
+    """
+    テーマに対応するフォルダから未使用の写真を1枚選んで返す。
+    全写真を使い切ったらリセットして最初から。
+    """
+    folder_name = THEME_TO_FOLDER.get(theme_type, "food")
+    folder_path = IMAGES_DIR / folder_name
+
+    # 利用可能な写真一覧（jpg/png/JPG/PNG）
+    extensions = ["*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG"]
+    photos = []
+    for ext in extensions:
+        photos.extend(folder_path.glob(ext))
+    photo_names = sorted(set(p.name for p in photos))
+
+    if not photo_names:
+        log(f"⚠️  images/{folder_name}/ フォルダに画像がありません")
+        return None
+
+    # 投稿済み記録を読み込む
+    posted = load_posted_photos()
+    used_in_folder = posted.get(folder_name, [])
+
+    # 未使用の写真を抽出
+    unused = [p for p in photo_names if p not in used_in_folder]
+
+    # 全部使い切ったらリセット
+    if not unused:
+        log(f"📷 images/{folder_name}/ の全写真を使い切りました。リセットします。")
+        used_in_folder = []
+        unused = photo_names
+
+    # 未使用の中からランダムに1枚選ぶ
+    selected = random.choice(unused)
+
+    # 使用済みに記録して保存
+    used_in_folder.append(selected)
+    posted[folder_name] = used_in_folder
+    save_posted_photos(posted)
+
+    log(f"📷 選択画像: images/{folder_name}/{selected}")
+    return f"{GITHUB_RAW_BASE}/{folder_name}/{selected}"
+
+
+# ===== コンテンツ生成 =====
+
 def generate_content(config: dict, theme: dict) -> dict:
     """Claude APIを使ってInstagram投稿コンテンツを生成する"""
     client = anthropic.Anthropic(api_key=config["claude"]["api_key"])
@@ -140,7 +215,6 @@ HASHTAGS:
 
     response_text = message.content[0].text
 
-    # キャプションとハッシュタグを分割
     caption = ""
     hashtags = ""
     if "CAPTION:" in response_text and "HASHTAGS:" in response_text:
@@ -148,7 +222,6 @@ HASHTAGS:
         caption = parts[0].replace("CAPTION:", "").strip()
         hashtags = parts[1].strip()
     else:
-        # フォールバック：全文をキャプションとして扱い、ハッシュタグをランダム選択
         caption = response_text.strip()
         hashtags = " ".join(random.sample(HASHTAGS_POOL, 12))
 
@@ -173,67 +246,51 @@ def save_draft(content: dict) -> Path:
     return filepath
 
 
-def post_to_instagram(config: dict, content: dict, image_path: str = None):
-    """
-    Meta Graph APIでInstagramに投稿する。
-    ※ config.jsonの instagram.access_token と instagram.ig_user_id を設定後に有効になります。
-    """
+def post_to_instagram(config: dict, content: dict, image_url: str = None):
+    """Meta Graph APIでInstagramに投稿する"""
     access_token = config["instagram"]["access_token"]
     ig_user_id = config["instagram"]["ig_user_id"]
 
-    # 未設定チェック
-    if "ここに" in access_token or "ここに" in ig_user_id:
-        log("⚠️  Meta APIキー未設定のため投稿をスキップします（ドラフト保存のみ）")
-        log("   → config.json の instagram.access_token と instagram.ig_user_id を設定してください")
+    if not access_token or not ig_user_id:
+        log("⚠️  Instagram APIキー未設定のためスキップします")
+        return None
+
+    if not image_url:
+        log("⚠️  画像URLがないため投稿をスキップします")
         return None
 
     caption_text = content["full_text"]
 
-    if image_path:
-        # 画像投稿
-        # STEP 1: メディアオブジェクト作成
-        create_url = f"https://graph.facebook.com/v21.0/{ig_user_id}/media"
-        create_params = {
-            "image_url": image_path,  # 公開URLが必要
-            "caption": caption_text,
-            "access_token": access_token,
-        }
-        res = requests.post(create_url, data=create_params)
-        res.raise_for_status()
-        creation_id = res.json()["id"]
+    # STEP 1: メディアオブジェクト作成
+    create_url = f"https://graph.facebook.com/v21.0/{ig_user_id}/media"
+    create_params = {
+        "image_url": image_url,
+        "caption": caption_text,
+        "access_token": access_token,
+    }
+    res = requests.post(create_url, data=create_params)
+    res.raise_for_status()
+    creation_id = res.json()["id"]
 
-        # STEP 2: 投稿を公開
-        publish_url = f"https://graph.facebook.com/v21.0/{ig_user_id}/media_publish"
-        publish_params = {
-            "creation_id": creation_id,
-            "access_token": access_token,
-        }
-        res = requests.post(publish_url, data=publish_params)
-        res.raise_for_status()
-        post_id = res.json()["id"]
-    else:
-        log("⚠️  画像なしの投稿はInstagramでサポートされていません。imagesフォルダに画像を追加してください。")
-        return None
+    # STEP 2: 投稿を公開
+    publish_url = f"https://graph.facebook.com/v21.0/{ig_user_id}/media_publish"
+    publish_params = {
+        "creation_id": creation_id,
+        "access_token": access_token,
+    }
+    res = requests.post(publish_url, data=publish_params)
+    res.raise_for_status()
+    post_id = res.json()["id"]
 
     log(f"✅ Instagram投稿完了: post_id={post_id}")
     return post_id
-
-
-def get_latest_image():
-    """imagesフォルダから最新の画像ファイルパスを取得する"""
-    images = sorted(IMAGES_DIR.glob("*.jpg")) + sorted(IMAGES_DIR.glob("*.png"))
-    if not images:
-        log("⚠️  images フォルダに画像がありません")
-        return None
-    # 未投稿の画像を優先（簡易実装：最新ファイルを使用）
-    return str(images[-1])
 
 
 def main():
     log("===== 自動投稿システム 起動 =====")
     config = load_config()
 
-    # テーマをランダム選択（週ごとのバランスを保つため）
+    # テーマをランダム選択
     theme = random.choice(CONTENT_THEMES)
     log(f"今回のテーマ: {theme['type']}")
 
@@ -242,32 +299,33 @@ def main():
     content = generate_content(config, theme)
     log("生成完了")
 
-    # ドラフト保存（常に保存）
+    # ドラフト保存
     draft_path = save_draft(content)
 
-    # Instagram投稿（Meta APIキーが設定されていれば実行）
-    image_path = get_latest_image()
-    post_id = post_to_instagram(config, content, image_path)
+    # テーマに合った未使用写真を取得
+    image_url = get_next_image(theme["type"])
+
+    # Instagram投稿
+    post_id = post_to_instagram(config, content, image_url)
 
     if post_id:
-        # 投稿済みフラグをドラフトに記録
         content["posted"] = True
         content["post_id"] = post_id
         with open(draft_path, "w", encoding="utf-8") as f:
             json.dump(content, f, ensure_ascii=False, indent=2)
-        log(f"✅ 完了: ドラフト更新済み")
+        log("✅ 完了: 投稿・ドラフト更新済み")
     else:
         log(f"📁 ドラフト保存済み: {draft_path.name}")
-        log("   Meta APIキー設定後は自動でInstagramに投稿されます")
+        if not image_url:
+            log("   → images/<フォルダ>/ に写真を追加してください")
 
     log("===== 終了 =====")
 
-    # 生成内容をターミナルにも表示
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print("【生成されたコンテンツ】")
-    print("="*50)
+    print("=" * 50)
     print(content["full_text"])
-    print("="*50)
+    print("=" * 50)
 
 
 if __name__ == "__main__":
