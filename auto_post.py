@@ -22,6 +22,11 @@ DRAFTS_DIR = BASE_DIR / "drafts"
 LOGS_DIR = BASE_DIR / "logs"
 IMAGES_DIR = BASE_DIR / "images"
 
+# ディレクトリが存在しない場合は作成
+DRAFTS_DIR.mkdir(exist_ok=True)
+LOGS_DIR.mkdir(exist_ok=True)
+IMAGES_DIR.mkdir(exist_ok=True)
+
 
 def load_config():
     # GitHub Actions の場合は環境変数から読み込む
