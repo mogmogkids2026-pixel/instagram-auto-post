@@ -50,7 +50,7 @@ def load_config():
         return {
             "claude": {
                 "api_key": os.environ["ANTHROPIC_API_KEY"],
-                "model": "claude-opus-4-6",
+                "model": "claude-haiku-4-5-20251001",
             },
             "instagram": {
                 "access_token": os.environ.get("INSTAGRAM_ACCESS_TOKEN", ""),
