@@ -10,6 +10,7 @@
 import json
 import os
 import random
+import time
 import requests
 import anthropic
 from datetime import datetime
@@ -206,12 +207,21 @@ HASHTAGS:
 
 キャプションは自然な会話調で、最後に行動喚起（保存・コメント・フォローなど）を1つ入れてください。"""
 
-    message = client.messages.create(
-        model=config["claude"]["model"],
-        max_tokens=1024,
-        messages=[{"role": "user", "content": user_prompt}],
-        system=system_prompt,
-    )
+    for attempt in range(3):
+        try:
+            message = client.messages.create(
+                model=config["claude"]["model"],
+                max_tokens=1024,
+                messages=[{"role": "user", "content": user_prompt}],
+                system=system_prompt,
+            )
+            break
+        except anthropic.APIStatusError as e:
+            if e.status_code == 529 and attempt < 2:
+                log(f"Claude API混雑中、30秒後リトライ ({attempt+1}/3)...")
+                time.sleep(30)
+            else:
+                raise
 
     response_text = message.content[0].text
 
